@@ -1,9 +1,10 @@
 package main
 
 import (
+	"github.com/Pauloo27/go-mpris"
+	"github.com/godbus/dbus/v5"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -11,26 +12,27 @@ import (
 var SLEEPTIME = time.Duration(60) * time.Second
 var COMPLETION_CUTOFF = 0.85
 
-func runPlayerctl(arguments []string) string {
-	pc := exec.Command("playerctl", arguments...)
-	output, _ := pc.Output()
-	return string(output)
+type streamer struct {
+	position, length float64
+	title            string
 }
+
 func moveToParser(filename string) {
 	directory, _ := strings.CutSuffix(os.Args[0], "scanner")
 	parser := exec.Command("python3", directory+filename)
 	parser.Stdout = os.Stdout
-	parser.Run()
+	err := parser.Run()
+	if err != nil {
+		panic(err)
+	}
 }
-func saveToFile(file_input *[][]string, already_written *[]string) {
+func saveToFile(in_streams *[]streamer, already_written *[]string) {
 	string_to_save := ""
-	for _, details := range *file_input {
-		current_time, _ := strconv.Atoi(details[0][1:])
-		max_time, _ := strconv.Atoi(details[1])
-		if float64(current_time)/float64(max_time) >= COMPLETION_CUTOFF {
+	for _, stream := range *in_streams {
+		if stream.position/stream.length >= COMPLETION_CUTOFF {
 			in_written := false
 			for _, name := range *already_written {
-				if name == details[2] {
+				if name == stream.title {
 					in_written = true
 					break
 				}
@@ -39,42 +41,46 @@ func saveToFile(file_input *[][]string, already_written *[]string) {
 				continue
 			}
 
-			string_to_save += details[2] + "\n"
-			*already_written = append(*already_written, details[2])
+			string_to_save += stream.title + "\n"
+			*already_written = append(*already_written, stream.title)
 		}
 	}
-	os.WriteFile("nearing_completion.txt", []byte(string_to_save), 0640)
+	err := os.WriteFile("nearing_completion.txt", []byte(string_to_save), 0640)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
 	already_written := make([]string, 4)
-	split_streams := [][]string{}
+	bus, err := dbus.ConnectSessionBus()
+	if err != nil {
+		panic(err)
+	}
+
 	for {
-		if runPlayerctl([]string{"-l"}) == "" {
+		names, _ := mpris.List(bus)
+		streams := make([]streamer, 0)
+		for _, name := range names {
+			player := mpris.New(bus, name)
+			metadata, _ := player.GetMetadata()
+			_, in := metadata["xesam:album"]
+			if !in {
+				pos, err1 := player.GetPosition()
+				length, err2 := player.GetLength()
+				title, err3 := metadata["xesam:title"].Value().(string)
+				if err1 != nil || err2 != nil || !err3 {
+					continue
+				}
+				streams = append(streams, streamer{pos, length, title})
+			}
+
+		}
+		if len(streams) == 0 {
 			time.Sleep(SLEEPTIME)
 			continue
 		}
-		removalList := strings.Split(runPlayerctl([]string{"-a", "metadata", "-f", "{{album}}"}), "\n")
-		list_streams := strings.Split(runPlayerctl([]string{"-a", "metadata", "-f", "'{{position}};{{mpris:length}};{{title}};{{mpris:length}}'"}), "\n")
-		for i := 0; i < len(removalList); i++ {
-			if removalList[i] != "" {
-				list_streams = append(list_streams[0:i], list_streams[i+1:]...)
-			}
-		}
-
-		for _, stream := range list_streams[:len(list_streams)-1] {
-			split_streams = append(split_streams, strings.Split(stream, ";"))
-		}
-		i := 0
-		for i < len(list_streams)-1 {
-			if (split_streams[i][1] + "'") != split_streams[i][len(split_streams[i])-1] {
-				split_streams = append(split_streams[0:i], split_streams[i+1:]...)
-			} else {
-				split_streams[i] = split_streams[i][:len(split_streams[i])-1]
-				i++
-			}
-		}
-		saveToFile(&split_streams, &already_written)
+		saveToFile(&streams, &already_written)
 		moveToParser("parser.py")
 	}
 
